@@ -38,6 +38,24 @@ docker compose up -d
 - API 地址：`http://localhost:3000/v1`
 - 数据目录：`./data`
 
+### Docker 分支自动发布到 Docker Hub
+
+仓库内置了参考 `multica` 的 GitHub Actions 工作流：当 `docker` 分支有新的 push 时，会自动构建并推送 Docker 镜像到 Docker Hub。
+
+需要提前在 GitHub 仓库中配置：
+
+- `DOCKERHUB_USERNAME`（secret）
+- `DOCKERHUB_TOKEN`（secret）
+- `DOCKERHUB_NAMESPACE`（variable，可选；未设置时默认使用 `DOCKERHUB_USERNAME`）
+
+默认会推送以下标签：
+
+- `docker`
+- `latest`
+- `sha-<commit>`
+
+当前工作流会构建 `linux/amd64` 与 `linux/arm64` 两种架构镜像。
+
 ### 本地开发
 
 启动后端：
