@@ -73,6 +73,17 @@ class AccountService:
         with self._lock:
             return list(self._accounts)
 
+    @staticmethod
+    def _normalize_email(value: object) -> str:
+        return str(value or "").strip().lower()
+
+    def _has_account_with_email(self, email: str) -> bool:
+        normalized_email = self._normalize_email(email)
+        if not normalized_email:
+            return False
+        with self._lock:
+            return any(self._normalize_email(item.get("email")) == normalized_email for item in self._accounts.values())
+
     def _list_ready_candidate_tokens(self, excluded_tokens: set[str] | None = None) -> list[str]:
         excluded = set(excluded_tokens or set())
         return [
@@ -160,14 +171,55 @@ class AccountService:
             self._accounts[access_token] = account
             self._save_accounts()
 
-    def remove_invalid_token(self, access_token: str, event: str) -> bool:
+    def _recover_removed_account_from_cpa(self, removed_account: dict, removed_token: str, event: str) -> bool:
+        email = self._normalize_email(removed_account.get("email"))
+        if not email or self._has_account_with_email(email):
+            return False
+
+        from services.cpa_service import find_remote_access_token_by_email
+
+        recovered = find_remote_access_token_by_email(email, excluded_tokens={removed_token})
+        if not recovered:
+            return False
+        recovered_token = str(recovered.get("token") or "").strip()
+        if not recovered_token:
+            return False
+
+        self.add_accounts([recovered_token])
+        try:
+            account = self.fetch_remote_info(recovered_token, event="cpa_recover")
+        except Exception:
+            return False
+
+        if account is None:
+            return False
+
+        log_service.add(
+            LOG_TYPE_ACCOUNT,
+            "CPA 自动回补账号",
+            {
+                "source": event,
+                "email": email,
+                "matched_email": recovered.get("email"),
+                "pool_id": recovered.get("pool_id"),
+                "pool_name": recovered.get("pool_name"),
+                "file_name": recovered.get("file_name"),
+                "token": anonymize_token(recovered_token),
+            },
+        )
+        return True
+
+    def remove_invalid_token(self, access_token: str, event: str, *, try_cpa_recovery: bool = True) -> bool:
         if not config.auto_remove_invalid_accounts:
             self.update_account(access_token, {"status": "异常", "quota": 0})
             return False
+        removed_account = self.get_account(access_token)
         removed = bool(self.delete_accounts([access_token])["removed"])
         if removed:
             log_service.add(LOG_TYPE_ACCOUNT, "自动移除异常账号",
                             {"source": event, "token": anonymize_token(access_token)})
+            if try_cpa_recovery and removed_account is not None:
+                self._recover_removed_account_from_cpa(removed_account, access_token, event)
         elif access_token:
             self.update_account(access_token, {"status": "异常", "quota": 0})
         return removed
@@ -305,7 +357,7 @@ class AccountService:
             from services.openai_backend_api import InvalidAccessTokenError, OpenAIBackendAPI
             result = OpenAIBackendAPI(access_token).get_user_info()
         except InvalidAccessTokenError:
-            self.remove_invalid_token(access_token, event)
+            self.remove_invalid_token(access_token, event, try_cpa_recovery=event != "cpa_recover")
             raise
         return self.update_account(access_token, result)
 

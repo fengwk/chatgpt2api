@@ -4,11 +4,13 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 os.environ.setdefault("CHATGPT2API_AUTH_KEY", "test-auth")
 
 from services.account_service import AccountService
 from services.auth_service import AuthService
+from services.config import config
 from services.storage.json_storage import JSONStorageBackend
 from utils.helper import anonymize_token
 
@@ -65,6 +67,85 @@ class AccountCapabilityTests(unittest.TestCase):
             self.assertEqual(updated["quota"], 0)
             self.assertEqual(updated["status"], "正常")
             self.assertTrue(updated["image_quota_unknown"])
+
+    def test_remove_invalid_token_recovers_from_cpa_when_same_email_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_accounts(["old-token"])
+            service.update_account(
+                "old-token",
+                {
+                    "email": "user@example.com",
+                    "type": "plus",
+                    "status": "正常",
+                    "quota": 120,
+                },
+            )
+
+            original = config.data.get("auto_remove_invalid_accounts")
+            config.data["auto_remove_invalid_accounts"] = True
+            try:
+                def fake_fetch_remote_info(access_token: str, event: str = "fetch_remote_info"):
+                    self.assertEqual(access_token, "new-token")
+                    self.assertEqual(event, "cpa_recover")
+                    service.update_account(
+                        "new-token",
+                        {
+                            "email": "user@example.com",
+                            "type": "plus",
+                            "status": "正常",
+                            "quota": 118,
+                        },
+                    )
+                    return service.get_account("new-token")
+
+                with patch(
+                    "services.cpa_service.find_remote_access_token_by_email",
+                    return_value={
+                        "token": "new-token",
+                        "pool_id": "pool-1",
+                        "pool_name": "main-pool",
+                        "file_name": "codex-user@example.com-plus.json",
+                        "email": "user@example.com",
+                    },
+                ) as mocked_find:
+                    with patch.object(service, "fetch_remote_info", side_effect=fake_fetch_remote_info):
+                        removed = service.remove_invalid_token("old-token", "image_stream")
+
+                self.assertTrue(removed)
+                self.assertIsNone(service.get_account("old-token"))
+                recovered = service.get_account("new-token")
+                self.assertIsNotNone(recovered)
+                self.assertEqual(recovered["email"], "user@example.com")
+                mocked_find.assert_called_once_with("user@example.com", excluded_tokens={"old-token"})
+            finally:
+                if original is None:
+                    config.data.pop("auto_remove_invalid_accounts", None)
+                else:
+                    config.data["auto_remove_invalid_accounts"] = original
+
+    def test_remove_invalid_token_skips_cpa_recovery_when_same_email_still_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_accounts(["old-token", "other-token"])
+            service.update_account("old-token", {"email": "user@example.com", "status": "正常", "quota": 120})
+            service.update_account("other-token", {"email": "user@example.com", "status": "正常", "quota": 100})
+
+            original = config.data.get("auto_remove_invalid_accounts")
+            config.data["auto_remove_invalid_accounts"] = True
+            try:
+                with patch("services.cpa_service.find_remote_access_token_by_email") as mocked_find:
+                    removed = service.remove_invalid_token("old-token", "image_stream")
+
+                self.assertTrue(removed)
+                self.assertIsNone(service.get_account("old-token"))
+                self.assertIsNotNone(service.get_account("other-token"))
+                mocked_find.assert_not_called()
+            finally:
+                if original is None:
+                    config.data.pop("auto_remove_invalid_accounts", None)
+                else:
+                    config.data["auto_remove_invalid_accounts"] = original
 
 
 class TokenLogTests(unittest.TestCase):

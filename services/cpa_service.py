@@ -66,6 +66,57 @@ def _management_headers(secret_key: str) -> dict[str, str]:
     }
 
 
+def _normalize_email(value: object) -> str:
+    return str(value or "").strip().lower()
+
+
+def _is_codex_remote_file(item: dict) -> bool:
+    remote_type = str(item.get("type") or "").strip().lower()
+    if remote_type:
+        return remote_type == "codex"
+    return "codex" in str(item.get("name") or "").strip().lower()
+
+
+def _load_remote_files(pool: dict) -> list[dict]:
+    base_url = str(pool.get("base_url") or "").strip()
+    secret_key = str(pool.get("secret_key") or "").strip()
+    if not base_url or not secret_key:
+        return []
+
+    url = f"{base_url.rstrip('/')}/v0/management/auth-files"
+    session = Session(**proxy_settings.build_session_kwargs(verify=True))
+    try:
+        response = session.get(url, headers=_management_headers(secret_key), timeout=30)
+        if not response.ok:
+            raise RuntimeError(f"remote list failed: HTTP {response.status_code}")
+        payload = response.json()
+    finally:
+        session.close()
+
+    files = payload.get("files") if isinstance(payload, dict) else None
+    if not isinstance(files, list):
+        raise RuntimeError("remote list payload is invalid")
+
+    items: list[dict] = []
+    for item in files:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        email = str(item.get("email") or item.get("account") or "").strip()
+        if not name:
+            continue
+        items.append(
+            {
+                "name": name,
+                "email": email,
+                "type": str(item.get("type") or "").strip() or None,
+                "disabled": bool(item.get("disabled")),
+                "unavailable": bool(item.get("unavailable")),
+            }
+        )
+    return items
+
+
 class CPAConfig:
     def __init__(self, store_file: Path):
         self._store_file = store_file
@@ -150,35 +201,14 @@ class CPAConfig:
 
 
 def list_remote_files(pool: dict) -> list[dict]:
-    base_url = str(pool.get("base_url") or "").strip()
-    secret_key = str(pool.get("secret_key") or "").strip()
-    if not base_url or not secret_key:
-        return []
-
-    url = f"{base_url.rstrip('/')}/v0/management/auth-files"
-    session = Session(**proxy_settings.build_session_kwargs(verify=True))
-    try:
-        response = session.get(url, headers=_management_headers(secret_key), timeout=30)
-        if not response.ok:
-            raise RuntimeError(f"remote list failed: HTTP {response.status_code}")
-        payload = response.json()
-    finally:
-        session.close()
-
-    files = payload.get("files") if isinstance(payload, dict) else None
-    if not isinstance(files, list):
-        raise RuntimeError("remote list payload is invalid")
-
-    items: list[dict] = []
-    for item in files:
-        if not isinstance(item, dict):
-            continue
-        name = str(item.get("name") or "").strip()
-        email = str(item.get("email") or item.get("account") or "").strip()
-        if not name:
-            continue
-        items.append({"name": name, "email": email})
-    return items
+    return [
+        {
+            "name": item["name"],
+            "email": item["email"],
+            "type": item.get("type"),
+        }
+        for item in _load_remote_files(pool)
+    ]
 
 
 def fetch_remote_access_token(pool: dict, file_name: str) -> tuple[str | None, str | None]:
@@ -207,6 +237,37 @@ def fetch_remote_access_token(pool: dict, file_name: str) -> tuple[str | None, s
     if not access_token:
         return None, "missing access_token"
     return access_token, None
+
+
+def find_remote_access_token_by_email(email: str, *, excluded_tokens: set[str] | None = None) -> dict | None:
+    normalized_email = _normalize_email(email)
+    if not normalized_email:
+        return None
+
+    excluded = {str(token or "").strip() for token in (excluded_tokens or set()) if str(token or "").strip()}
+    for pool in cpa_config.list_pools():
+        try:
+            files = _load_remote_files(pool)
+        except Exception:
+            continue
+
+        for item in files:
+            if _normalize_email(item.get("email")) != normalized_email:
+                continue
+            if not _is_codex_remote_file(item):
+                continue
+            if bool(item.get("disabled")) or bool(item.get("unavailable")):
+                continue
+            token, _ = fetch_remote_access_token(pool, str(item.get("name") or ""))
+            if token and token not in excluded:
+                return {
+                    "token": token,
+                    "pool_id": str(pool.get("id") or "").strip() or None,
+                    "pool_name": str(pool.get("name") or "").strip() or None,
+                    "file_name": str(item.get("name") or "").strip() or None,
+                    "email": str(item.get("email") or "").strip() or normalized_email,
+                }
+    return None
 
 
 class CPAImportService:
